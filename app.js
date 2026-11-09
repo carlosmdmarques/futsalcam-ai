@@ -6,6 +6,9 @@
   const probe = document.createElement('canvas');
   probe.width = 192; probe.height = 108;
   const analysis = probe.getContext('2d', {willReadFrequently: true});
+  const details = document.createElement('canvas');
+  const detailContext = details.getContext('2d', {willReadFrequently:true});
+  let previousDetail = null, tracker = new CompactTracker(), detailZoom = 0;
   const entire = {left: 0, top: 0, right: 1, bottom: 1};
   const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
   const number = (value, digits = 0) => value.toLocaleString('pt-PT', {maximumFractionDigits: digits});
@@ -16,6 +19,7 @@
   let wantedX = .5, wantedY = .5, viewX = .5, viewY = .5;
 
   function resetAnalysis() {
+    previousDetail = null; tracker = new CompactTracker(); detailZoom = 0;
     previous = null; lastMedia = null; hit = null; misses = 0; lastHit = 0;
     samples = draws = 0; rateStart = performance.now(); sampleTime = 0;
     el('fps').textContent = 'Análise — fps · Ecrã — fps';
@@ -23,9 +27,25 @@
     el('debug').textContent = auto ? 'À espera de fotogramas distintos.' : 'Análise suspensa em modo manual.';
   }
 
+  function compactTarget(media) {
+    const w = Math.min(source.videoWidth, 768);
+    const h = Math.max(16, Math.min(768, Math.round(w*source.videoHeight/source.videoWidth)));
+    if (details.width !== w || details.height !== h) {
+      details.width = w; details.height = h; previousDetail = null; tracker = new CompactTracker();
+    }
+    detailContext.drawImage(source,0,0,w,h);
+    const data = detailContext.getImageData(0,0,w,h).data;
+    const light = new Uint8Array(w*h);
+    // The weakest colour channel favours pale details over saturated kit and floor colours.
+    for (let i=0; i<light.length; i++) light[i] = Math.min(data[i*4],data[i*4+1],data[i*4+2]);
+    const points = previousDetail ? compactCandidates(light,previousDetail,w,h,roi,Number(el('contrast').value)) : [];
+    previousDetail = light;
+    return tracker.update(points,media);
+  }
+
   function sample(now, media) {
     if (!auto || selecting || source.readyState < 2 || source.seeking || media === lastMedia) return;
-    if (lastMedia !== null && (media < lastMedia || media - lastMedia > .8)) previous = null;
+    if (lastMedia !== null && (media < lastMedia || media - lastMedia > .8)) resetAnalysis();
     if (previous && media >= lastMedia && media - lastMedia < .093) return;
     lastMedia = media;
     try {
@@ -36,20 +56,22 @@
         const k = i * 4;
         gray[i] = (3 * rgba[k] + 6 * rgba[k+1] + rgba[k+2]) / 10;
       }
+      const candidate = compactTarget(media);
       if (previous) {
         const result = measureMotion(gray, previous, probe.width, probe.height, roi,
           Number(el('contrast').value), Number(el('area').value));
         samples++;
-        hit = result.target;
+        if (result.percent > 55) tracker = new CompactTracker();
+        hit = result.percent > 55 ? null : candidate;
         if (hit) {
           wantedX = hit.x; wantedY = hit.y; lastHit = now; misses = 0;
-          el('tracking').textContent = 'Alvo · X ' + number(hit.x*100) + '% · Y ' + number(hit.y*100) + '%';
+          el('tracking').textContent = 'Candidato · X ' + number(hit.x*100) + '% · Y ' + number(hit.y*100) + '%';
         } else {
           misses++;
-          if (now - lastHit > 3000) wantedX = wantedY = .5;
-          el('tracking').textContent = 'Sem alvo · ' + misses + ' análises consecutivas';
+          el('tracking').textContent = 'Sem trajetória confirmada · ' + misses + ' análises';
         }
-        el('debug').textContent = (hit ? 'Movimento localizado' : result.reason) +
+        el('debug').textContent = (hit ? 'A seguir detalhe claro em movimento' :
+          (result.target ? 'Movimento sem candidato único · a abrir o plano' : result.reason)) +
           ' · Área ativa ' + number(result.percent, 2) + '%';
       } else {
         hit = null;
@@ -60,6 +82,7 @@
       previous = gray;
     } catch (error) {
       previous = hit = null;
+      previousDetail = null; tracker = new CompactTracker(); lastHit = 0;
       el('tracking').textContent = 'Alvo —';
       el('debug').textContent = 'Falha ao ler o vídeo · ' + error.message;
     }
@@ -74,8 +97,12 @@
   // The same transform serves drawing, overlay placement and touch coordinates.
   function geometry() {
     const w = source.videoWidth, h = source.videoHeight;
-    const scale = selecting ? Math.min(canvas.width/w, canvas.height/h) :
-      Math.max(canvas.width/w, canvas.height/h) * Number(el('zoom').value);
+    const fit = Math.min(canvas.width/w, canvas.height/h);
+    const fill = Math.max(canvas.width/w, canvas.height/h);
+    const zoom = Number(el('zoom').value);
+    let scale = fill*zoom;
+    if (auto) scale = fit + (fill*Math.min(1.5,zoom)-fit)*detailZoom;
+    if (selecting) scale = fit;
     const dw = Math.min(canvas.width, w*scale), dh = Math.min(canvas.height, h*scale);
     const sw = dw/scale, sh = dh/scale;
     return {sx: clamp(viewX*w-sw/2, 0, w-sw), sy: clamp(viewY*h-sh/2, 0, h-sh),
@@ -88,6 +115,9 @@
     if (source.readyState >= 2 && source.videoWidth) {
       if (!source.requestVideoFrameCallback) sample(now, source.currentTime);
       const dt = Math.min(.1, (now-lastDraw)/1000);
+      const closeIn = auto && hit && now-lastHit < 350;
+      detailZoom += ((closeIn ? 1 : 0)-detailZoom)*(1-Math.exp(-dt*(closeIn ? 1.5 : 4)));
+      if (detailZoom < .005) detailZoom = 0;
       const ease = 1-Math.exp(-dt*(11-Number(el('smooth').value)/10));
       viewX += (wantedX-viewX)*ease; viewY += (wantedY-viewY)*ease;
       crop = geometry();
